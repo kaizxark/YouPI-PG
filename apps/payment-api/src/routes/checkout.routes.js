@@ -170,7 +170,12 @@ function sanitizePublicBranding(raw = {}) {
  * Recovery: the next create succeeds once a heartbeat is fresh. In-flight sessions are not cancelled.
  */
 export function observerHealthEnforced() {
-  if (process.env.YOUPI_ENFORCE_OBSERVER_HEALTH === 'true') return true;
+  const configured = String(process.env.YOUPI_ENFORCE_OBSERVER_HEALTH ?? '').trim().toLowerCase();
+  if (configured === 'true') return true;
+  // An operator may deliberately run with manual bank-statement reconciliation
+  // instead of a live SMS/Gmail observer. The manual-reconcile endpoint is still
+  // admin-only and still requires the 12-digit UTR from the bank statement.
+  if (configured === 'false') return false;
   if (process.env.NODE_ENV === 'test') return false;
   return true;
 }
