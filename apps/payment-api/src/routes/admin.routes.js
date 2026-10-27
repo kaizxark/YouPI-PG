@@ -392,6 +392,175 @@ export function registerAdminRoutes(server, ctx) {
     });
   });
 
+  /**
+   * POST /api/v1/admin/payments/:id/manual-reconcile
+   *
+   * Records a UPI credit after an operator has seen it in the school's bank
+   * statement. The operator supplies the 12-digit UTR and the value date; the
+   * session is moved through OBSERVED_SUCCESS to RECONCILED and the signed
+   * RECONCILED webhook is dispatched.
+   *
+   * This exists for deployments that deliberately do not run a bank SMS/Gmail
+   * observer. It is not an observer shortcut: the caller must already hold the
+   * admin credential, and the UTR is stored so the same credit cannot be posted
+   * twice. Observers remain the only way to reconcile without a human.
+   */
+  server.post('/api/v1/admin/payments/:id/manual-reconcile', async (req, res, params) => {
+    const body = await HttpServer.parseBody(req).catch(() => ({}));
+    const operatorId = String(body.operatorId || 'admin-operator').trim();
+    const session = ctx.sessionRepo.findById(params.id);
+    if (!session) {
+      HttpServer.json(res, 404, { error: `Payment session not found: ${params.id}` });
+      return;
+    }
+    if (session.method !== PaymentMethod.UPI) {
+      HttpServer.json(res, 400, { error: 'Manual bank reconciliation is only valid for UPI sessions.' });
+      return;
+    }
+    if (session.status === PaymentStatus.RECONCILED) {
+      HttpServer.json(res, 200, { reconciled: true, duplicate: true, paymentId: session.id, status: session.status });
+      return;
+    }
+    if ([PaymentStatus.SUCCESS, PaymentStatus.FAILED, PaymentStatus.EXPIRED, PaymentStatus.CANCELLED].includes(session.status)) {
+      HttpServer.json(res, 409, { error: `Cannot reconcile a payment in terminal status '${session.status}'.` });
+      return;
+    }
+
+    const utr = String(body.utr || '').replace(/\s+/g, '');
+    if (!/^\d{12}$/.test(utr)) {
+      HttpServer.json(res, 400, { error: 'utr must be the 12-digit UPI reference from the bank statement.' });
+      return;
+    }
+    const bookedOn = String(body.bookedOn || new Date().toISOString().slice(0, 10));
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(bookedOn)) {
+      HttpServer.json(res, 400, { error: 'bookedOn must be YYYY-MM-DD.' });
+      return;
+    }
+    if (!session.receivingAccountId) {
+      HttpServer.json(res, 409, { error: 'This session has no receiving account and cannot be reconciled.' });
+      return;
+    }
+
+    const existingObservation = ctx.db.queryOne(
+      'SELECT id, attributed_payment_id FROM payment_observations WHERE receiving_account_id = ? AND bank_reference_number = ?',
+      [session.receivingAccountId, utr]
+    );
+    if (existingObservation && existingObservation.attributed_payment_id !== session.id) {
+      HttpServer.json(res, 409, { error: 'That UTR is already attributed to another payment.' });
+      return;
+    }
+
+    const observationId = existingObservation?.id || crypto.randomUUID();
+    const now = new Date().toISOString();
+    const fingerprintHash = crypto.createHash('sha256')
+      .update(['MANUAL_STATEMENT', session.receivingAccountId, utr, String(session.amountPaise), bookedOn].join('|'))
+      .digest('hex');
+    const sourceHash = crypto.createHash('sha256')
+      .update([session.receivingAccountId, bookedOn, String(session.amountPaise), 'CREDIT', utr, '1', `manual:${utr}`].join('|'))
+      .digest('hex');
+    const statementLineId = crypto.randomUUID();
+
+    let updated;
+    try {
+      updated = ctx.db.transaction(() => {
+        if (!existingObservation) {
+          ctx.obsRepo.create({
+            id: observationId,
+            receivingAccountId: session.receivingAccountId,
+            source: 'MANUAL_BANK_STATEMENT',
+            amountPaise: session.amountPaise,
+            observedAt: new Date(`${bookedOn}T00:00:00.000Z`),
+            senderVpa: body.senderVpa || null,
+            bankReferenceNumber: utr,
+            fingerprintHash,
+            rawPayload: { source: 'manual_statement', operatorId, notes: body.notes || null },
+            attributionStatus: 'ATTRIBUTED',
+            attributedPaymentId: session.id
+          });
+        } else {
+          ctx.obsRepo.markAttributed(observationId, session.id);
+        }
+
+        let current = ctx.sessionRepo.findById(session.id);
+        if (current.status === PaymentStatus.ACTIVE || current.status === PaymentStatus.PROCESSING) {
+          current = ctx.sessionRepo.transitionToTerminal(session.id, PaymentStatus.OBSERVED_SUCCESS, {
+            attributedObservationId: observationId
+          });
+        }
+        if (current.status === PaymentStatus.OBSERVED_SUCCESS || current.status === PaymentStatus.MANUAL_REVIEW) {
+          current = ctx.sessionRepo.transitionToTerminal(session.id, PaymentStatus.RECONCILED, {
+            attributedObservationId: observationId
+          });
+        }
+        if (current.status !== PaymentStatus.RECONCILED) {
+          throw new Error(`Cannot reconcile a payment in status '${current.status}'.`);
+        }
+
+        try {
+          ctx.db.execute(`
+            INSERT INTO bank_statement_lines (
+              id, receiving_account_id, source_hash, booked_on, amount_paise, currency,
+              direction, utr, narration, match_status, match_reason, payment_session_id, imported_at
+            ) VALUES (?, ?, ?, ?, ?, 'INR', 'CREDIT', ?, ?, 'RECONCILED', 'MANUAL_BANK_STATEMENT', ?, ?)
+          `, [
+            statementLineId,
+            session.receivingAccountId,
+            sourceHash,
+            bookedOn,
+            session.amountPaise,
+            utr,
+            `manual:${utr}`,
+            session.id,
+            now
+          ]);
+        } catch (error) {
+          if (!/UNIQUE/i.test(error.message || '')) throw error;
+        }
+
+        return current;
+      });
+    } catch (error) {
+      HttpServer.json(res, 409, { error: error.message || 'Manual reconciliation failed.' });
+      return;
+    }
+
+    if (ctx.auditRepo) {
+      ctx.auditRepo.log({
+        merchantId: session.merchantId,
+        entityType: 'PAYMENT_SESSION',
+        entityId: session.id,
+        action: 'PAYMENT_MANUALLY_RECONCILED_FROM_BANK_STATEMENT',
+        actorType: AuditActorType.ADMIN,
+        actorId: operatorId,
+        details: { utr, bookedOn, statementLineId, notes: body.notes || null }
+      });
+    }
+
+    server.broadcastSse(session.id, 'status_change', {
+      status: PaymentStatus.RECONCILED,
+      method: session.method,
+      orderId: session.orderId
+    });
+
+    if (ctx.eventEmitter) {
+      ctx.eventEmitter.emit('PAYMENT.RECONCILED', {
+        paymentId: updated.id,
+        orderId: session.orderId,
+        merchantId: session.merchantId,
+        amountPaise: session.amountPaise,
+        statementLineId
+      });
+    }
+
+    HttpServer.json(res, 200, {
+      reconciled: true,
+      paymentId: updated.id,
+      status: updated.status,
+      utr,
+      statementLineId
+    });
+  });
+
   // POST /api/v1/admin/counter-decline (Declines/Rejects manual cash or card counter payment)
   server.post('/api/v1/admin/counter-decline', async (req, res) => {
     const body = await HttpServer.parseBody(req);

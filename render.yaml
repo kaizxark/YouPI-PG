@@ -1,34 +1,65 @@
-
 services:
   - type: web
-    name: youpi-pg-demo
+    name: youpi-pg
     runtime: node
-    plan: free
+    plan: starter
+    region: singapore
     buildCommand: npm ci
-    startCommand: node scripts/start-render-demo.js
+    startCommand: node apps/payment-api/src/index.js
     healthCheckPath: /health
-
+    autoDeploy: true
+    disk:
+      name: youpi-data
+      mountPath: /data
+      sizeGB: 1
     envVars:
       - key: NODE_VERSION
         value: 24.22.1
-
       - key: NODE_ENV
         value: production
-
       - key: YOUPI_BIND_HOST
         value: 0.0.0.0
-
-      - key: USE_SQLITE_FALLBACK
+      - key: YOUPI_MODE
+        value: localhost
+      - key: YOUPI_ALLOW_LOCALHOST_MODE
         value: "true"
-
-      - key: ENCRYPTION_MASTER_KEY
-        generateValue: true
-
-      - key: JWT_SECRET
-        generateValue: true
-
       - key: YOUPI_ALLOW_DEV_TOOLS
         value: "false"
-
-      - key: YOUPI_EXPOSE_DEV_OTP
+      - key: YOUPI_ENFORCE_OBSERVER_HEALTH
         value: "false"
+      - key: YOUPI_SEED_DEMO_CUSTOMER
+        value: "false"
+      - key: SQLITE_DB_PATH
+        value: /data/youpi_pg.sqlite
+      - key: PAYMENT_ACTIVE_WINDOW_MS
+        value: "900000"
+      - key: PAYMENT_PROCESSING_WINDOW_MS
+        value: "60000"
+      - key: WEBHOOK_MAX_RETRIES
+        value: "10"
+      - key: DEFAULT_MERCHANT_NAME
+        value: Global Kids School
+      - key: DEFAULT_MERCHANT_SLUG
+        value: global-kids-school
+      - key: DEFAULT_SUPPORT_PHONE
+        value: "7760902954"
+      - key: DEFAULT_UPI_ID
+        value: 7760902954@ybl
+      - key: DEFAULT_PAYEE_NAME
+        value: Global Kids School
+      - key: COIN_STORE_WEBHOOK_URL
+        value: https://ggs-erp.vercel.app/api/fee-payment-webhook
+      - key: ENCRYPTION_MASTER_KEY
+        generateValue: true
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_API_TOKEN
+        generateValue: true
+      - key: COIN_STORE_WEBHOOK_SECRET
+        generateValue: true
+      - key: INTERNAL_SERVICE_TOKEN
+        generateValue: true
+      - key: DEVICE_CREDENTIAL_KEY
+        generateValue: true
+      - key: BLIND_INDEX_KEY
+        generateValue: true

@@ -137,6 +137,7 @@ export function createPaymentApp(customDb = null, options = {}) {
   server.use(authGuard);
   let checkoutBaseUrl = process.env.CHECKOUT_PUBLIC_URL
     || process.env.PUBLIC_APP_URL
+    || process.env.RENDER_EXTERNAL_URL
     || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null)
     || process.env.BASE_CHECKOUT_URL
     || 'http://localhost:7000';

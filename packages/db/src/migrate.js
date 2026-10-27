@@ -180,6 +180,15 @@ export function runMigrations(targetDb) {
     }
   }
 
+  // A hosted deployment must be configurable without editing the database by
+  // hand. These are idempotent, so a restart repairs drift in configuration.
+  if (process.env.COIN_STORE_WEBHOOK_URL) {
+    merchantRepo.update(defaultMerchant.id, { webhookUrl: process.env.COIN_STORE_WEBHOOK_URL.trim() });
+  }
+  if (process.env.COIN_STORE_WEBHOOK_SECRET) {
+    merchantRepo.update(defaultMerchant.id, { webhookSecret: process.env.COIN_STORE_WEBHOOK_SECRET.trim() });
+  }
+
   // Seed default UPI receiving account if none
   const accountRepo = new ReceivingAccountRepository(db);
   const accounts = accountRepo.findByMerchantId(defaultMerchant.id);
@@ -187,10 +196,16 @@ export function runMigrations(targetDb) {
     accountRepo.create({
       id: '00000000-0000-0000-0000-000000000002',
       merchantId: defaultMerchant.id,
-      upiId: 'merchant@upi',
-      payeeName: defaultMerchant.businessName,
+      upiId: process.env.DEFAULT_UPI_ID || 'merchant@upi',
+      payeeName: process.env.DEFAULT_PAYEE_NAME || defaultMerchant.businessName,
       isActive: true
     });
+  } else if (process.env.DEFAULT_UPI_ID) {
+    accountRepo.upsertActiveForMerchant(
+      defaultMerchant.id,
+      process.env.DEFAULT_UPI_ID,
+      process.env.DEFAULT_PAYEE_NAME || defaultMerchant.businessName
+    );
   }
 
   // Demo customer seeding is opt-in and never carries real personal data.
